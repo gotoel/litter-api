@@ -28,6 +28,12 @@ type Client struct {
 	robots map[string]Robot
 }
 
+type resetDrawerBody struct {
+	CycleCount            int     `json:"cycleCount"`
+	CycleCapacity         float64 `json:"cycleCapacity"`
+	CyclesAfterDrawerFull int     `json:"cyclesAfterDrawerFull"`
+}
+
 // New returns an initialized *Client.
 func New(email, password string) *Client {
 	auth := auth.New(email, password)
@@ -62,28 +68,13 @@ func (c *Client) SetToken(token string) {
 // FetchRobots fetches the robots from the LitterRobot API.
 // The robots are cached on the client and can be fetched without additional network calls using Robots() or Robot(id)
 func (c *Client) FetchRobots(ctx context.Context) error {
-	robotEndpoint := fmt.Sprintf("/users/%s/robots", c.auth.UserID())
+	path := fmt.Sprintf("/users/%s/robots", c.auth.UserID())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+robotEndpoint, nil)
-	if err != nil {
-		return errors.Wrap(err, "error creating robot request")
-	}
-
-	req.Header = map[string][]string{
-		"Authorization": []string{fmt.Sprintf("Bearer %s", c.auth.IDToken())},
-		"x-api-key":     []string{apiKey},
-	}
-
-	resp, err := c.api.Do(req)
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return errors.Wrap(err, "error fetching robots")
 	}
-
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
 
 	bd, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -131,7 +122,7 @@ func (c *Client) Robots() []Robot {
 
 // FetchInsights returns the Litter Robot insights for the specified period. This function always makes a network call.
 func (c *Client) FetchInsights(ctx context.Context, id string, days, tzOffset int) (*Insight, error) {
-	insightsURL := fmt.Sprintf("/users/%s/robots/%s/insights", c.auth.UserID(), id)
+	path := fmt.Sprintf("/users/%s/robots/%s/insights", c.auth.UserID(), id)
 
 	if days < 1 {
 		return nil, errors.New("days must be greather than 0")
@@ -141,74 +132,72 @@ func (c *Client) FetchInsights(ctx context.Context, id string, days, tzOffset in
 	params.Set("days", fmt.Sprintf("%d", days))
 	params.Set("timezoneOffset", fmt.Sprintf("%d", tzOffset))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+insightsURL+"?"+params.Encode(), nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "error creating insights request")
-	}
-
-	req.Header = map[string][]string{
-		"Authorization": []string{fmt.Sprintf("Bearer %s", c.auth.IDToken())},
-		"x-api-key":     []string{apiKey},
-	}
-
-	resp, err := c.api.Do(req)
+	resp, err := c.do(ctx, http.MethodGet, path+"?"+params.Encode(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "error sending insights request")
 	}
-
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	bd, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "error reading insights body")
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
 	var insight *Insight
-	if err := json.Unmarshal(body, &insight); err != nil {
+	if err := json.Unmarshal(bd, &insight); err != nil {
 		return nil, errors.Wrap(err, "error unmarshaling insights response")
 	}
 
 	return insight, nil
 }
 
-func (c *Client) sendCommand(ctx context.Context, robotId, command string) error {
-	cmdPath := fmt.Sprintf("/users/%s/robots/%s/dispatch-commands", c.auth.UserID(), robotId)
-
-	cmd := &commandBody{
-		Command:       command,
-		LitterRobotId: robotId,
+func (c *Client) do(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	var payload io.Reader
+	if body != nil {
+		bd, err := json.Marshal(body)
+		if err != nil {
+			return nil, errors.Wrap(err, "error marshaling body")
+		}
+		payload = bytes.NewBuffer(bd)
 	}
 
-	body, err := json.Marshal(cmd)
+	req, err := http.NewRequestWithContext(ctx, method, apiURL+path, payload)
 	if err != nil {
-		return errors.Wrap(err, "error marshaling command body")
-	}
-
-	payload := bytes.NewBuffer(body)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL+cmdPath, payload)
-	if err != nil {
-		return errors.Wrap(err, "error building command request")
+		return nil, errors.Wrap(err, "error creating request")
 	}
 
 	req.Header = map[string][]string{
-		"Authorization": []string{fmt.Sprintf("Bearer %s", c.auth.IDToken())},
-		"x-api-key":     []string{apiKey},
+		"Authorization": {fmt.Sprintf("Bearer %s", c.auth.IDToken())},
+		"x-api-key":     {apiKey},
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	resp, err := c.api.Do(req)
 	if err != nil {
-		return errors.Wrap(err, "error sending command")
+		return nil, errors.Wrap(err, "error executing request")
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		resp.Body.Close()
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	return resp, nil
+}
+
+func (c *Client) sendCommand(ctx context.Context, robotId, command string) error {
+	path := fmt.Sprintf("/users/%s/robots/%s/dispatch-commands", c.auth.UserID(), robotId)
+	cmd := &commandBody{
+		Command:       command,
+		LitterRobotId: robotId,
+	}
+	resp, err := c.do(ctx, http.MethodPost, path, cmd)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
 	return nil
 }
 
@@ -250,4 +239,22 @@ func (c *Client) Cycle(ctx context.Context, robotId string) error {
 // Wait - Set clean cycle wait time.
 func (c *Client) Wait(ctx context.Context, robotId string, val string) error {
 	return c.sendCommand(ctx, robotId, waitCmd+val)
+}
+
+// ResetDrawer resets the gauge to 0% by updating the cycle counts directly.
+func (c *Client) ResetDrawer(ctx context.Context, robotId string) error {
+	r := c.Robot(robotId)
+	path := fmt.Sprintf("/users/%s/robots/%s", c.auth.UserID(), robotId)
+	payload := resetDrawerBody{
+		CycleCount:            0,
+		CyclesAfterDrawerFull: 0,
+		CycleCapacity:         r.CycleCapacity,
+	}
+
+	resp, err := c.do(ctx, http.MethodPatch, path, payload)
+	if err != nil {
+		return errors.Wrap(err, "error resetting drawer")
+	}
+	resp.Body.Close()
+	return nil
 }
